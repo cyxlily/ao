@@ -126,7 +126,7 @@ class Int8Tensor(TorchAOBaseTensor):
                 block_size, w_hp.size()
             )
             scale = w_hp.view(shape_for_reduction)
-            scale = torch.amin(scale, dim=reduction_dims, keepdim=False)
+            scale = torch.amin(scale, keepdim=False)
             scale = scale.fill_(act_quant_kwargs.act_quant_scale)
             scale = scale.to(device=w_hp.device, dtype=w_hp.dtype)
             if act_quant_kwargs.act_quant_zero_point is not None:
@@ -137,7 +137,7 @@ class Int8Tensor(TorchAOBaseTensor):
 
             int_data = quantize_affine(
                 w_hp,
-                block_size=block_size,
+                block_size=w_hp.shape,
                 scale=scale,
                 zero_point=zero_point,
                 output_dtype=torch.int8,
