@@ -139,7 +139,7 @@ def int_scaled_matmul(
             a = (a.to(torch.int32) + 128).to(torch.uint8)
             c = torch._int_mm(a, b)
             comp = b.sum(dim=0,keepdim=True, dtype=torch.int32) * 128
-            c = sub_(comp)
+            c.sub_(comp)
             return c.to(scales1.dtype) * scales1
         else: # int8 path
             c = torch._int_mm(a, b)
