@@ -36,6 +36,9 @@ class QuantizeTensorToInt8Kwargs(QuantizeTensorKwargs):
     """
 
     granularity: Granularity = PerRow()
+    mapping_type: MappingType = MappingType.SYMMETRIC
+    scale: Optional[torch.Tensor] = None
+    zero_point: Optional[torch.Tensor] = None
 
 
 class Int8Tensor(TorchAOBaseTensor):
@@ -55,12 +58,18 @@ class Int8Tensor(TorchAOBaseTensor):
     # TODO: Static quantization support using `static_scale`
     tensor_data_names = ["qdata", "scale"]
     tensor_attribute_names = ["granularity"]
-    optional_tensor_attribute_names = ["act_quant_kwargs", "block_size", "dtype"]
+    optional_tensor_attribute_names = [
+        "zero_point",
+        "act_quant_kwargs",
+        "block_size",
+        "dtype",
+        ]
 
     def __new__(
         cls: type,
         qdata: torch.Tensor,
         scale: torch.Tensor,
+        zero_point: Optional[torch.Tensor] = None,
         granularity: Optional[Granularity] = None,
         block_size: Optional[torch.Size] = None,
         act_quant_kwargs: Optional[QuantizeTensorToInt8Kwargs] = None,
@@ -77,6 +86,7 @@ class Int8Tensor(TorchAOBaseTensor):
         self,
         qdata: torch.Tensor,
         scale: torch.Tensor,
+        zero_point: Optional[torch.Tensor] = None,
         granularity: Granularity,
         block_size: Optional[torch.Size] = None,
         act_quant_kwargs: Optional[QuantizeTensorToInt8Kwargs] = None,
@@ -95,6 +105,7 @@ class Int8Tensor(TorchAOBaseTensor):
             f"act_quant_kwargs={self.act_quant_kwargs}, "
             f"qdata={self.qdata}, "
             f"scale={self.scale}, "
+            f"zero_point={self.zero_point}, "
             f"granularity={self.granularity}, "
             f"block_size={self.block_size}, "
             f"shape={self.shape}, "
@@ -108,6 +119,9 @@ class Int8Tensor(TorchAOBaseTensor):
         w_hp: torch.Tensor,
         granularity: Granularity = PerRow(),
         act_quant_kwargs: Optional[QuantizeTensorToInt8Kwargs] = None,
+        scale: Optional[torch.Tensor] = None,
+        zero_point: Optional[torch.Tensor] = None,
+        mapping_type: MappingType = MappingType.SYMMETRIC,
     ):
         """Create Int8Tensor from high-precision tensor"""
         block_size = get_block_size(w_hp.shape, granularity)
@@ -118,16 +132,22 @@ class Int8Tensor(TorchAOBaseTensor):
                 f"got tensor dim={w_hp.dim()}, block_size length={len(block_size)}"
             )
 
-        scale, zero_point = choose_qparams_affine(
-            input=w_hp,
-            mapping_type=MappingType.SYMMETRIC,
-            block_size=block_size,
-            target_dtype=torch.int8,
-            quant_min=-128,
-            quant_max=127,
-            scale_dtype=w_hp.dtype,
-            zero_point_dtype=torch.int8,
-        )
+        # if scale and zero_point not given, then choose them dynamically
+        if scale is None and zero_point is None:
+            scale, zero_point = choose_qparams_affine(
+                input=w_hp,
+                mapping_type=mapping_type,
+                block_size=block_size,
+                target_dtype=torch.int8,
+                quant_min=-128,
+                quant_max=127,
+                scale_dtype=hp_tensor.dtype,
+                zero_point_dtype=torch.int8,
+                keepdim=True,
+            )
+
+        # if they are given, then use them to quantize
+        # this is how we support static quantization
 
         int_data = quantize_affine(
             w_hp,
@@ -153,11 +173,15 @@ class Int8Tensor(TorchAOBaseTensor):
 
         block_size = get_block_size(self.qdata.shape, self.granularity)
 
+        zero_point = self.zero_point
+        if zero_point is not None:
+            zero_point = zero_point.squeeze()
+
         return dequantize_affine(
             input=self.qdata,
             block_size=block_size,
             scale=self.scale,
-            zero_point=None,
+            zero_point=zero_point,
             input_dtype=torch.int8,
             quant_min=-128,
             quant_max=127,
@@ -244,7 +268,11 @@ def _(func, types, args, kwargs):
 
     if weight_tensor.act_quant_kwargs is not None:
         activation_tensor = Int8Tensor.from_hp(
-            activation_tensor, weight_tensor.act_quant_kwargs.granularity
+            activation_tensor,
+            granularity=weight_tensor.act_quant_kwargs.granularity,
+            mapping_type=weight_tensor.act_quant_kwargs.mapping_type,
+            scale=weight_tensor.act_quant_kwargs.scale,
+            zero_point=weight_tensor.act_quant_kwargs.zero_point,
         )
         # Dynamic activation quantization path
 

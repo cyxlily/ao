@@ -39,8 +39,26 @@ class TestInt8Tensor(TorchAOIntegrationTestCase):
     @common_utils.parametrize(
         "config",
         [
-            Int8DynamicActivationInt8WeightConfig(version=2),
-            Int8WeightOnlyConfig(version=2),
+            Int8DynamicActivationInt8WeightConfig(
+                version=2,
+                granularity=PerRow(),
+                act_mapping_type=MappingType.ASYMMETRIC
+            ),
+            Int8DynamicActivationInt8WeightConfig(
+                version=2,
+                granularity=PerTensor(),
+                act_mapping_type=MappingType.SYMMETRIC
+            ),
+            Int8WeightOnlyConfig(
+                version=2,
+                granularity=PerRow(),
+                act_mapping_type=MappingType.ASYMMETRIC
+            ),
+            Int8WeightOnlyConfig(
+                version=2,
+                granularity=PerTensor(),
+                act_mapping_type=MappingType.SYMMETRIC
+            ),
         ],
     )
     def test_creation_and_attributes(self, config):
