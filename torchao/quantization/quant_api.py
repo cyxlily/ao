@@ -1658,7 +1658,7 @@ class Int8StaticActivationInt8WeightConfig(AOBaseConfig):
         version (int): the version of the config
     """
 
-    scale: torch.Tensor
+    scale: Optional[torch.Tensor] = None
     granularity: Granularity = PerRow()
     act_mapping_type: Optional[MappingType] = MappingType.SYMMETRIC
     set_inductor_config: bool = True
