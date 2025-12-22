@@ -81,6 +81,7 @@ from .quant_primitives import (
 )
 from .quantize_.workflows import (
     Float8Tensor,
+    Int8Tensor,
     Int4MarlinSparseTensor,
     Int4PlainInt32Tensor,
     Int4PreshuffledTensor,
