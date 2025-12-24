@@ -1321,8 +1321,8 @@ def _int8_dynamic_activation_int8_weight_quantize_tensor(weight, config):
         )
         quantized_weight = to_linear_activation_quantized(new_weight, input_quant_func)
     else:
-        assert isinstance(config.granularity, (tuple, list)) and len(config.granularity) == 2, (
-            "granularity should be a tuple or list of length 2"
+        assert isinstance(config.granularity, list) and len(config.granularity) == 2, (
+            "granularity should be a list of length 2"
         )
         granularity = config.granularity
         act_granularity, weight_granularity = granularity
@@ -1450,8 +1450,8 @@ def _int8_static_activation_int8_weight_transform(
     *,
     parameter_name="weight",
 ):
-    assert isinstance(config.granularity, (tuple, list)) and len(config.granularity) == 2, (
-        "granularity should be a tuple or list of length 2"
+    assert isinstance(config.granularity, list) and len(config.granularity) == 2, (
+        "granularity should be a list of length 2"
     )
     granularity = config.granularity
     act_granularity, weight_granularity = granularity
