@@ -97,7 +97,8 @@ def _smooth_quant_transform(
     else:
         raise ValueError(f"Unexpected step: {step}")
 
-    if isinstance(base_config, Int8StaticActivationInt8WeightConfig):
+    if hasattr(base_config, 'static_scale'):
+        # Static quantization
         quant_kwargs = QuantizeTensorToInt8Kwargs(
             granularity=base_config.granularity[0],
             mapping_type=base_config.act_mapping_type,

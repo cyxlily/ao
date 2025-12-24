@@ -86,7 +86,10 @@ class TestSmoothQuant(unittest.TestCase):
     @common_utils.parametrize(
         "base_config",
         [
-            Int8DynamicActivationInt8WeightConfig(version=2),
+            Int8DynamicActivationInt8WeightConfig(version=2, granularity=PerRow()),
+            Int8DynamicActivationInt8WeightConfig(version=2, granularity=PerTensor()),
+            Int8DynamicActivationInt8WeightConfig(version=2, granularity=[PerTensor(), PerRow()]),
+            Int8DynamicActivationInt8WeightConfig(version=2, granularity=[PerRow(), PerTensor()]),
             Int8StaticActivationInt8WeightConfig(granularity=PerRow()),
             Int8StaticActivationInt8WeightConfig(granularity=PerTensor()),
             Int8StaticActivationInt8WeightConfig(granularity=[PerTensor(), PerRow()]),
@@ -112,7 +115,7 @@ class TestSmoothQuant(unittest.TestCase):
             quantize_(
                 basic_model,
                 Int8DynamicActivationInt8WeightConfig(
-                    version=2, granularity=base_config.granularity[1]
+                    version=2, granularity=base_config.granularity
                 ),
             )
         else:
