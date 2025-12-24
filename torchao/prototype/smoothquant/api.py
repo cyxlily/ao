@@ -99,7 +99,7 @@ def _smooth_quant_transform(
 
     if isinstance(base_config, Int8StaticActivationInt8WeightConfig):
         quant_kwargs = QuantizeTensorToInt8Kwargs(
-            granularity=base_config.granularity,
+            granularity=base_config.granularity[0],
             mapping_type=base_config.act_mapping_type,
         )
     else:
