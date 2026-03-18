@@ -2034,6 +2034,309 @@ def _register_smooth_quant_int_mm_pattern():
                 )
 
 
+def _register_static_smooth_quant_u8s8_pattern():
+    """
+    Pattern for static SmoothQuant with uint8 activation (u8) and int8 weight (s8),
+    i.e., asymmetric activation quantization where a non-zero zero_point correction
+    is subtracted after the int8 matmul and activation-scale multiply.
+
+    The full pattern is:
+      (no bias) reshape -> _int_mm -> convert_element_type
+                -> (expand ->) mul(x_scale) -> sub(zp_correction) -> mul(w_scale) -> reshape
+    or
+      (with bias) pattern_no_bias -> add(bias) (-> reshape -> reshape)
+
+    The transformation folds the zp_correction into an effective bias so that the
+    result can be computed by onednn.qlinear_pointwise with x_zp=None (zero-point
+    handled via the adjusted bias term):
+      effective_bias = bias - zp_correction * w_scale
+    """
+
+    def get_pattern_no_bias(expand_a_scale: bool, reshape_a: bool = True):
+        return CallFunction(
+            aten.mul.Tensor,
+            CallFunction(
+                aten.sub.Tensor,
+                CallFunction(
+                    aten.mul.Tensor,
+                    CallFunction(
+                        prims.convert_element_type.default,
+                        CallFunction(
+                            aten._int_mm.default,
+                            CallFunction(
+                                aten.reshape.default,
+                                KeywordArg("a"),
+                                KeywordArg("in_shape"),
+                            )
+                            if reshape_a
+                            else KeywordArg("a"),
+                            KeywordArg("b"),
+                        ),
+                        KeywordArg("dtype"),
+                    ),
+                    (
+                        CallFunction(
+                            aten.expand.default,
+                            KeywordArg("x_scale"),
+                            Arg(),
+                        )
+                        if expand_a_scale
+                        else KeywordArg("x_scale")
+                    ),
+                ),
+                KeywordArg("zp_correction"),
+            ),
+            KeywordArg("w_scale"),
+        )
+
+    def _with_outer_reshape(pattern):
+        return CallFunction(
+            aten.reshape.default, pattern, KeywordArg("out_shape_no_bias")
+        )
+
+    # for torch.compile(dynamic=False)
+    pattern_no_bias_1 = _with_outer_reshape(get_pattern_no_bias(expand_a_scale=False))
+    pattern_with_bias_1 = CallFunction(
+        aten.add.Tensor,
+        pattern_no_bias_1,
+        KeywordArg("bias"),
+    )
+    # for torch.compile(dynamic=True)
+    pattern_no_bias_2 = _with_outer_reshape(get_pattern_no_bias(expand_a_scale=True))
+    pattern_with_bias_2 = CallFunction(
+        aten.reshape.default,
+        CallFunction(
+            aten.reshape.default,
+            CallFunction(
+                aten.add.Tensor,
+                pattern_no_bias_2,
+                KeywordArg("bias"),
+            ),
+            Arg(),
+        ),
+        KeywordArg("out_shape_with_bias"),
+    )
+
+    # No outer reshape / no act reshape variants (2-D input)
+    pattern1_with_no_outer_or_act_reshape = get_pattern_no_bias(
+        expand_a_scale=False, reshape_a=False
+    )
+    pattern2_with_no_outer_or_act_reshape = get_pattern_no_bias(
+        expand_a_scale=True, reshape_a=False
+    )
+
+    def _validate_u8s8_pattern(match: Match):
+        # Node counts: sub adds 1 compared to the s8s8 patterns
+        # s8s8 valid counts: [4,5,6,7,10]
+        # u8s8 valid counts: [5,6,7,8,11] (one extra sub node)
+        if len(match.nodes) not in [5, 6, 7, 8, 11]:
+            return False
+        # Make sure weight is a constant
+        aten_int_mm_node = filter_nodes(match.nodes, aten._int_mm.default)[0]
+        if not isinstance(aten_int_mm_node.args[1], torch.fx.node.Node):
+            return False
+        if aten_int_mm_node.args[1].op != "get_attr":
+            return False
+        # Make sure zp_correction is a constant (get_attr)
+        sub_nodes = filter_nodes(match.nodes, aten.sub.Tensor)
+        if not sub_nodes:
+            return False
+        zp_correction_node = sub_nodes[0].args[1]
+        if not isinstance(zp_correction_node, torch.fx.node.Node):
+            return False
+        if zp_correction_node.op != "get_attr":
+            return False
+        # For the bias variant with two trailing reshapes (dynamic=True)
+        if len(match.nodes) == 11:
+            if match.nodes[10].args[1] != match.nodes[7].args[1]:
+                return False
+        if len(match.nodes) == 11 or (
+            len(match.nodes) == 8 and match.nodes[7].target is aten.add.Tensor
+        ):
+            bias_idx = 8 if len(match.nodes) == 11 else 7
+            bias_node = match.nodes[bias_idx].args[1]
+            if not isinstance(bias_node, torch.fx.node.Node):
+                return False
+            if len(bias_node.meta.get("tensor_meta").shape) != 1:  # type: ignore[union-attr]
+                return False
+        return True
+
+    pattern_to_pass_number = {
+        pattern_no_bias_2: 0,
+        pattern_with_bias_2: 0,
+        pattern_no_bias_1: 1,
+        pattern_with_bias_1: 1,
+        pattern1_with_no_outer_or_act_reshape: 2,
+        pattern2_with_no_outer_or_act_reshape: 2,
+    }
+    for pattern, pass_number in pattern_to_pass_number.items():
+
+        @register_freezing_graph_pattern(
+            pattern,
+            extra_check=_validate_u8s8_pattern,
+            pass_number=pass_number,
+        )
+        def _static_u8s8_weight_prepack(match: Match, *args, **kwargs):
+            bias = kwargs.get("bias", None)
+            x = kwargs["a"]
+            weight = kwargs["b"]
+            dtype = kwargs["dtype"]
+            x_scale = kwargs["x_scale"]
+            w_scale = kwargs["w_scale"]
+            zp_correction = kwargs["zp_correction"]
+
+            x_shape = x.meta.get("tensor_meta").shape
+            if has_free_symbols(x_shape):
+                x_shape = None
+
+            out_node = match.output_node()
+            with match.graph.inserting_before(out_node):
+                transpose_node = match.graph.call_function(
+                    aten.permute.default, args=(weight, [1, 0])
+                )
+                contig_node = match.graph.call_function(
+                    aten.contiguous.default, args=(transpose_node,)
+                )
+                packed_weight_inputs = (contig_node, x_shape)
+                packed_weight_op = torch.ops.onednn.qlinear_prepack
+                prepack_weight_node = match.graph.call_function(
+                    packed_weight_op, args=packed_weight_inputs
+                )
+
+                dummy_zp = None
+                w_scale_fp32 = match.graph.call_function(
+                    prims.convert_element_type.default, args=(w_scale, torch.float32)
+                )
+
+                x_scale_shape = x_scale.meta.get("tensor_meta").shape
+                x_scale_is_scalar = False
+                if not has_free_symbols(x_scale_shape):
+                    prod = 1
+                    for d in x_scale_shape:
+                        prod *= d
+                    x_scale_is_scalar = prod == 1
+
+                new_args: tuple[Any, ...]
+                if x_scale_is_scalar:
+                    # Per-tensor activation scale: fold zp_correction into an effective
+                    # bias so that qlinear_pointwise handles everything.
+                    # original: ((x @ w) * x_scale - zp_correction) * w_scale + bias
+                    #         = (x @ w) * x_scale * w_scale
+                    #           - zp_correction * w_scale + bias
+                    # qlinear(x, x_scale, None, pw, w_scale, None, eff_bias):
+                    #         = (x @ w) * x_scale * w_scale + eff_bias
+                    # => eff_bias = bias - zp_correction * w_scale
+                    # Reshape both tensors to 1D to ensure correct broadcast behaviour
+                    # when computing the per-channel bias correction.
+                    zp_flat = match.graph.call_function(
+                        aten.reshape.default, args=(zp_correction, [-1])
+                    )
+                    wscale_flat = match.graph.call_function(
+                        aten.reshape.default, args=(w_scale_fp32, [-1])
+                    )
+                    zp_bias_correction = match.graph.call_function(
+                        aten.mul.Tensor,
+                        args=(zp_flat, wscale_flat),
+                    )
+                    if bias is not None:
+                        effective_bias = match.graph.call_function(
+                            aten.sub.Tensor, args=(bias, zp_bias_correction)
+                        )
+                    else:
+                        effective_bias = match.graph.call_function(
+                            aten.neg.default, args=(zp_bias_correction,)
+                        )
+                    new_args = (
+                        x,
+                        x_scale,
+                        dummy_zp,  # x_zp
+                        prepack_weight_node,
+                        w_scale_fp32,
+                        dummy_zp,  # w_zp
+                        effective_bias,
+                        1.0,  # output_scale
+                        0,  # output_zero_point
+                        dtype,  # output_dtype
+                        "none",  # post op name
+                        [],  # post op args
+                        "",  # post op algorithm
+                    )
+                    new_linear_node = match.graph.call_function(
+                        torch.ops.onednn.qlinear_pointwise.tensor, args=new_args
+                    )
+                    out_node.replace_all_uses_with(new_linear_node)
+                    new_linear_node.meta.update(out_node.meta)
+                else:
+                    # Per-row activation scale: qlinear does not support per-channel x,
+                    # so apply x_scale manually; also subtract zp_correction afterwards.
+                    in_shape = kwargs.get("in_shape", None)
+                    if in_shape is None:
+                        x_reshaped = x
+                    else:
+                        x_reshaped = match.graph.call_function(
+                            aten.reshape.default, args=(x, in_shape)
+                        )
+                    new_args = (
+                        x_reshaped,
+                        1.0,  # x_scale (applied manually below)
+                        0,  # x_zp
+                        prepack_weight_node,
+                        w_scale_fp32,
+                        dummy_zp,  # w_zp
+                        None,  # bias (applied manually below)
+                        1.0,  # output_scale
+                        0,  # output_zero_point
+                        dtype,  # output_dtype
+                        "none",  # post op name
+                        [],  # post op args
+                        "",  # post op algorithm
+                    )
+                    new_linear_node = match.graph.call_function(
+                        torch.ops.onednn.qlinear_pointwise, args=new_args
+                    )
+                    # apply x_scale
+                    new_out_node = match.graph.call_function(
+                        aten.mul.Tensor, args=(new_linear_node, x_scale)
+                    )
+                    # subtract zp_correction (broadcast [M,N] - [1,N] or [N])
+                    new_out_node = match.graph.call_function(
+                        aten.sub.Tensor, args=(new_out_node, zp_correction)
+                    )
+
+                    has_outer_reshape = (
+                        kwargs.get("out_shape_with_bias", None) is not None
+                        or kwargs.get("out_shape_no_bias", None) is not None
+                    )
+                    if has_outer_reshape:
+                        out_shape = kwargs.get(
+                            "out_shape_with_bias", kwargs["out_shape_no_bias"]
+                        )
+                    if bias is not None:
+                        new_out_node = match.graph.call_function(
+                            aten.add.Tensor, args=(new_out_node, bias)
+                        )
+                        if has_outer_reshape:
+                            new_out_node = match.graph.call_function(
+                                aten.reshape.default,
+                                args=(new_out_node, out_shape),  # type: ignore[possibly-undefined]
+                            )
+                    else:
+                        if has_outer_reshape:
+                            new_out_node = match.graph.call_function(
+                                aten.reshape.default,
+                                args=(new_out_node, out_shape),  # type: ignore[possibly-undefined]
+                            )
+                    out_node.replace_all_uses_with(new_out_node)
+                    new_out_node.meta.update(out_node.meta)
+
+                for node in reversed(match.nodes):
+                    match.graph.erase_node(node)
+                counters["inductor"]["qlinear_weight_prepack_matcher_count"] += 1
+                counters["inductor"]["qlinear_weight_prepack_matcher_nodes"] += len(
+                    match.nodes
+                )
+
+
 class PostOpAttr:
     def __init__(
         self,
@@ -3216,6 +3519,8 @@ def _register_quantization_weight_pack_pass():
 
     # Step 4: weight prepack for SmoothQuant from Torchao
     _register_smooth_quant_int_mm_pattern()
+    # Step 4b: weight prepack for static SmoothQuant u8s8 (asymmetric activation)
+    _register_static_smooth_quant_u8s8_pattern()
 
     # Step 5: QLinear post op Fusion
     if not torch.ops.mkldnn._is_mkldnn_acl_supported():
